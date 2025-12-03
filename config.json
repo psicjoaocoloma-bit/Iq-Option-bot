@@ -1,0 +1,8 @@
+{
+    "email": "n4vajero@gmail.com",
+    "password": "Amaia1921",
+    "balance": "PRACTICE",
+    "log_dir": "logs",
+    "poll_interval": 0.4,
+    "auto_log_ingest": true
+}

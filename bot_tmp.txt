@@ -1,0 +1,776 @@
+"""TradingLions main orchestrator following the CodeX overhaul brief (multi-asset)."""
+
+from __future__ import annotations
+
+import time
+
+from dataclasses import dataclass
+
+from typing import Any, Dict, Optional
+
+from collector import MarketCollector
+
+from config import BotConfig
+
+from decision_engine import Decision, DecisionEngine
+
+from execution import ExecutionEngine
+
+from logger import TradeLogger
+
+@dataclass(slots=True)
+
+class PendingEntry:
+
+    asset: str
+
+    decision: Decision
+
+    payout: float
+
+    next_open_timestamp: float
+
+class TradingLionsBot:
+
+    """Coordinates collector, decision engine, execution, and logging for multiple assets."""
+
+    def __init__(self, config: Optional[BotConfig] = None, tick_interval: float = 1.0, api: Any | None = None) -> None:
+
+        self.config = config or BotConfig()
+
+        self.tick_interval = tick_interval
+
+        self.api = api
+
+        # Activo "principal" de referencia (no exclusivo)
+
+        self.asset = self.config.asset
+
+        # Collector y stores por activo
+
+        self.collector = MarketCollector(self.config.signals)
+
+        for a in self.config.assets:
+
+            self.collector._ensure_store(a)
+
+        self.decision_engine = DecisionEngine(self.config, api=self.api)
+
+        self.logger = TradeLogger(self.config)
+
+        self.execution = ExecutionEngine(self.config, api=self.api, trade_logger=self.logger)
+
+        self.pending_entry: Optional[PendingEntry] = None
+
+        self.current_trade: Optional[Dict[str, Any]] = None
+
+        self.martingale_level = 0
+
+        self.reinforced = False
+
+        self._running = False
+
+        # Control de riesgo diario
+
+        self.daily_profit: float = 0.0
+
+        self._risk_blocked: bool = False
+
+        self._last_pnl_reset_day: int = time.localtime().tm_yday
+
+    # ------------------------------------------------------------------
+
+    # Diagnostics
+
+    # ------------------------------------------------------------------
+
+    def _debug(self, msg: str) -> None:
+
+        print(f"[DEBUG {time.strftime('%H:%M:%S')}] {msg}")
+
+    # ------------------------------------------------------------------
+
+    # Main loop
+
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
+
+        self._running = True
+
+        while self._running:
+
+            try:
+
+                tick_time = time.time()
+
+                self._sync_market_data(tick_time)
+
+                self._handle_signal(tick_time)
+
+                self._enter_trade(tick_time)
+
+                self._resolve_trade(tick_time)
+
+                time.sleep(self.tick_interval)
+
+            except Exception as e:
+
+                print(f"[CRITICAL LOOP ERROR] {e}")
+
+    def stop(self) -> None:
+
+        self._running = False
+
+    # ------------------------------------------------------------------
+
+    # Signal handling and risk gating
+
+    # ------------------------------------------------------------------
+
+    def _handle_signal(self, tick_time: float) -> None:
+
+        # Riesgo diario activo
+
+        if self._risk_blocked:
+
+            self._debug("Riesgo bloqueado ? no se generan señales.")
+
+            return
+
+        # No generar señal con operación activa o pendiente
+
+        if self.execution.has_active_order():
+
+            self._debug("Orden activa detectada ? esperando resolución.")
+
+            return
+
+        if self.pending_entry is not None:
+
+            self._debug(f"Entrada pendiente en {self.pending_entry.asset} ? esperando apertura.")
+
+            return
+
+        best: Optional[PendingEntry] = None
+
+        self._debug("---- ESCANEO DE ACTIVOS ----")
+
+        for asset in self.config.assets:
+
+            payout = self._fetch_current_payout(asset)
+
+            vol = self._estimate_volatility(asset)
+
+            self._debug(f"{asset}: payout={payout:.2f}, vol={vol:.5f}")
+
+            if payout < self.config.signals.min_payout:
+
+                self._debug(" ? DESCARTADO por payout insuficiente")
+
+                continue
+
+            if vol < self.config.signals.min_volatility:
+
+                self._debug(" ? DESCARTADO por volatilidad insuficiente")
+
+                continue
+
+            decision = self.decision_engine.evaluate(self.collector, asset, payout)
+
+            if decision is None:
+
+                self._debug(" ? NO HAY SEÑAL válida")
+
+                continue
+
+            self._debug(
+
+                f" ? SEÑAL: {decision.pattern.upper()} | dir={decision.direction} | "
+
+                f"score={decision.score:.2f} | regime={decision.regime}"
+
+            )
+
+            next_open = self._next_candle_open_timestamp(tick_time)
+
+            candidate = PendingEntry(
+
+                asset=asset,
+
+                decision=decision,
+
+                payout=payout,
+
+                next_open_timestamp=next_open,
+
+            )
+
+            # Selección del mejor score
+
+            if best is None or decision.score > best.decision.score:
+
+                best = candidate
+
+                self._debug(" ? NUEVO MEJOR CANDIDATO")
+
+        if best is None:
+
+            self._debug("NO se encontró ninguna señal válida en este tick.")
+
+            return
+
+        self.pending_entry = best
+
+        self._debug(
+
+            f"? MEJOR SEÑAL: {best.asset} | {best.decision.pattern.upper()} | "
+
+            f"score={best.decision.score:.2f} | hora programada={best.next_open_timestamp}"
+
+        )
+
+    # ------------------------------------------------------------------
+
+    # Entries and martingale management
+
+    # ------------------------------------------------------------------
+
+    def _enter_trade(self, tick_time: float) -> None:
+
+        if self.pending_entry is None:
+
+            return
+
+        if tick_time + 0.05 < self.pending_entry.next_open_timestamp:
+
+            return
+
+        asset = self.pending_entry.asset
+
+        open_price = self._fetch_open_price(asset)
+
+        stake = self._current_stake()
+
+        self._debug(f"Intentando abrir orden en {asset}…")
+
+        order = self.execution.open_order(
+
+            asset=asset,
+
+            direction=self.pending_entry.decision.direction,
+
+            stake=stake,
+
+            payout=self.pending_entry.payout,
+
+            regime=self.pending_entry.decision.regime,
+
+            reason=self.pending_entry.decision.reason,
+
+            entry_price=open_price,
+
+        )
+
+        if order is None:
+
+            self._debug("? IQ Option rechazó la orden ? Liberando pending_entry")
+
+            self.pending_entry = None
+
+            return
+
+        entry = self.pending_entry
+
+        order["pattern"] = entry.decision.pattern
+
+        order["score"] = entry.decision.score
+
+        self.current_trade = {
+
+            "order": order,
+
+            "decision": entry.decision,
+
+            "decision_score": entry.decision.score,
+
+            "decision_pattern": entry.decision.pattern,
+
+            "payout": entry.payout,
+
+            "entry_price": open_price,
+
+            "asset": asset,
+
+            "timestamp": tick_time,
+
+            "scheduled_open": entry.next_open_timestamp,
+
+        }
+
+        # FIX: asegurar que ExecutionEngine conserva la orden activa
+
+        self.execution._active_order = order
+
+        self.pending_entry = None
+
+        self._debug(
+
+            f"? ORDEN ABIERTA: {asset} | {entry.decision.direction.upper()} | stake={stake}"
+
+        )
+
+    def _current_stake(self) -> float:
+
+        return self.config.risk.base_stake * (self.config.risk.martingale_multiplier ** self.martingale_level)
+
+    def _try_reinforce(self, tick_time: float) -> None:
+
+        """
+
+        Refuerzo inteligente:
+
+        - Reentrar SOLO si precio va en contra.
+
+        - Mantiene coherencia direccional.
+
+        - Usa martingale.
+
+        """
+
+        if not self.execution.has_active_order():
+
+            return
+
+        if self.reinforced:
+
+            return
+
+        if self.martingale_level >= self.config.risk.max_martingale_steps:
+
+            return
+
+        order = getattr(self.execution, '_active_order', None)
+
+        if not isinstance(order, dict):
+
+            return
+
+        asset = order["asset"]
+
+        direction = order["direction"]
+
+        entry_price = float(order.get("entry_price", 0.0))
+
+        candles = self.collector.get_candles_m1(asset, 1)
+
+        if not candles:
+
+            return
+
+        last_price = float(candles[-1].get("close", entry_price))
+
+        if direction == "call" and last_price < entry_price * 0.998:
+
+            self._debug(f"[REFUERZO] CALL mejorado en {asset}")
+
+            self._execute_reinforcement(asset, direction, last_price)
+
+            return
+
+        if direction == "put" and last_price > entry_price * 1.002:
+
+            self._debug(f"[REFUERZO] PUT mejorado en {asset}")
+
+            self._execute_reinforcement(asset, direction, last_price)
+
+            return
+
+    def _execute_reinforcement(self, asset: str, direction: str, last_price: float) -> None:
+
+        stake = self._current_stake()
+
+        payout = self.collector.get_payout(asset)
+
+        order = self.execution.open_order(
+
+            asset=asset,
+
+            direction=direction,
+
+            stake=stake,
+
+            payout=payout,
+
+            regime="reinforcement",
+
+            reason="price improvement",
+
+            entry_price=last_price,
+
+        )
+
+        if order:
+
+            self.reinforced = True
+
+            self._debug(f"[? REFUERZO EJECUTADO] {asset} | {direction.upper()} stake={stake}")
+
+    # ------------------------------------------------------------------
+
+    # Result handling and daily risk
+
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+
+    # Result handling and daily risk
+
+    # ------------------------------------------------------------------
+
+    def _resolve_trade(self, tick_time: float) -> None:
+
+        # Si no hay orden activa, no hay nada que resolver
+
+        if not self.execution.has_active_order():
+
+            return
+
+        active_order = getattr(self.execution, '_active_order', None)
+
+        order_id = None
+
+        if isinstance(active_order, dict):
+
+            order_id = active_order.get('order_id')
+
+        self._debug(f"Resolviendo trade para order_id={order_id}")
+
+        try:
+
+            result = self.execution.check_result()
+
+        except Exception as e:
+
+            self._debug(f"[ERROR] check_result generó excepción: {e}")
+
+            return
+
+        # Si la API aún no devuelve resultado (ni timeout), lo indicamos
+
+        if result is None:
+
+            self._try_reinforce(tick_time)
+
+            opened_at = tick_time
+
+            if isinstance(active_order, dict):
+
+                opened_at = float(active_order.get('opened_at', tick_time))
+
+            elapsed = tick_time - opened_at
+
+            self._debug(f"Esperando resultado ({elapsed:.1f}s)...")
+
+            return
+
+        # Si llegamos aquí, ya tenemos resultado normalizado (real o por timeout)
+
+        outcome = result.get('outcome', 'LOOSE')
+
+        profit = float(result.get('profit', 0.0))
+
+        ts = float(result.get('timestamp', tick_time))
+
+        self._update_martingale(outcome)
+
+        self._update_daily_profit(profit, ts)
+
+        # Feedback a DecisionEngine para ir aprendiendo
+
+        if self.current_trade and 'decision' in self.current_trade:
+
+            decision = self.current_trade['decision']
+
+            try:
+
+                self.decision_engine.register_outcome(decision, outcome)
+
+            except Exception as e:
+
+                print(f"[DECISION ENGINE ERROR] {e}")
+
+        self._debug(
+
+            f"RESULTADO: {outcome} | profit={profit:.2f} | "
+
+            f"PnL diario={self.daily_profit:.2f} | martingale={self.martingale_level}"
+
+        )
+
+        self.current_trade = None
+
+        self.reinforced = False
+
+    def _update_martingale(self, outcome: str) -> None:
+
+        if outcome == "WIN":
+
+            self.martingale_level = 0
+
+            return
+
+        if self.martingale_level >= self.config.risk.max_martingale_steps:
+
+            self.martingale_level = 0
+
+            return
+
+        self.martingale_level += 1
+
+    def _update_daily_profit(self, profit: float, ts: float) -> None:
+
+        """Acumula PnL diario y activa bloque de riesgo si se supera SL o TP."""
+
+        lt = time.localtime(ts)
+
+        # Cambio de día ? reseteamos PnL y desbloqueamos el riesgo
+
+        if lt.tm_yday != self._last_pnl_reset_day:
+
+            self._last_pnl_reset_day = lt.tm_yday
+
+            self.daily_profit = 0.0
+
+            self._risk_blocked = False
+
+        self.daily_profit += profit
+
+        stop_loss = getattr(self.config.risk, "daily_stop_loss", None)
+
+        take_profit = getattr(self.config.risk, "daily_take_profit", None)
+
+        if stop_loss is not None and self.daily_profit <= -abs(stop_loss):
+
+            self._risk_blocked = True
+
+        if take_profit is not None and self.daily_profit >= abs(take_profit):
+
+            self._risk_blocked = True
+
+    # ------------------------------------------------------------------
+
+    # Helpers and integrations
+
+    # ------------------------------------------------------------------
+
+    def _sync_market_data(self, tick_time: float) -> None:
+
+        if self.api is None:
+
+            return
+
+        # Actualizamos velas y payout para todos los assets
+
+        for asset in self.config.assets:
+
+            snapshot = self._fetch_market_snapshot(asset)
+
+            self._apply_market_snapshot(snapshot, tick_time)
+
+    def _apply_market_snapshot(self, snapshot: Dict[str, Any], tick_time: float) -> None:
+
+        asset = snapshot["asset"]
+
+        for timeframe, candles in snapshot["candles"].items():
+
+            for candle in candles:
+
+                self.collector.ingest(asset, timeframe, candle)
+
+        self.collector.update_payout(asset, snapshot["payout"])
+
+    def _fetch_market_snapshot(self, asset: str) -> Dict[str, Any]:
+
+        if self.api is None:
+
+            raise RuntimeError("API not configured")
+
+        now = time.time()
+
+        try:
+
+            raw_m1 = self.api.get_candles(asset, self.config.timeframe, 3, now)
+
+            raw_m5 = self.api.get_candles(asset, self.config.higher_timeframe, 3, now)
+
+            payouts = self.api.get_all_profit()
+
+        except Exception:
+
+            return {
+
+                "asset": asset,
+
+                "candles": {"M1": [], "M5": []},
+
+                "payout": self.collector.get_payout(asset),
+
+            }
+
+        def _normalize_candles(raw):
+
+            if raw is None:
+
+                return []
+
+            if isinstance(raw, dict):
+
+                return [raw]
+
+            if isinstance(raw, (list, tuple)):
+
+                out = []
+
+                for c in raw:
+
+                    if isinstance(c, dict):
+
+                        out.append(c)
+
+                return out
+
+            return []
+
+        candles_m1 = _normalize_candles(raw_m1)
+
+        candles_m5 = _normalize_candles(raw_m5)
+
+        payout = 0.0
+
+        if isinstance(payouts, dict):
+
+            info = payouts.get(asset)
+
+            if isinstance(info, dict):
+
+                for key in ("turbo", "binary", "digital"):
+
+                    if key in info and info[key]:
+
+                        try:
+
+                            payout = float(info[key])
+
+                            break
+
+                        except (TypeError, ValueError):
+
+                            continue
+
+        return {
+
+            "asset": asset,
+
+            "candles": {"M1": candles_m1, "M5": candles_m5},
+
+            "payout": payout,
+
+        }
+
+    def _fetch_current_payout(self, asset: str) -> float:
+
+        payout = self.collector.get_payout(asset)
+
+        if payout > 0:
+
+            return payout
+
+        if self.api is None:
+
+            return 0.0
+
+        snapshot = self._fetch_market_snapshot(asset)
+
+        self._apply_market_snapshot(snapshot, time.time())
+
+        return snapshot["payout"]
+
+    def _estimate_volatility(self, asset: str) -> float:
+
+        candles = self.collector.get_candles_m1(asset, 20)
+
+        if len(candles) < 10:
+
+            return 0.0
+
+        return self.collector.compute_volatility(candles)
+
+    def _next_candle_open_timestamp(self, tick_time: float) -> float:
+
+        interval = int(self.config.timeframe)
+
+        base = int(tick_time) - (int(tick_time) % interval)
+
+        next_open = base + interval
+
+        if next_open - tick_time < 0.05:
+
+            next_open += interval
+
+        return float(next_open)
+
+    def _fetch_open_price(self, asset: str) -> float:
+
+        if self.api is None:
+
+            candles = self.collector.get_candles_m1(asset, 1)
+
+            if candles:
+
+                return float(candles[-1].get("close", 0.0))
+
+            return 0.0
+
+        try:
+
+            live = self.api.get_live_candle(asset, self.config.timeframe)
+
+            if isinstance(live, dict):
+
+                return float(live.get("open", live.get("current", live.get("close", 0.0))))
+
+        except Exception:
+
+            pass
+
+        now = time.time()
+
+        candles = self.api.get_candles(asset, self.config.timeframe, 1, now)
+
+        if isinstance(candles, dict):
+
+            c = candles
+
+        elif isinstance(candles, (list, tuple)) and candles:
+
+            c = candles[-1]
+
+        else:
+
+            candles = self.collector.get_candles_m1(asset, 1)
+
+            if candles:
+
+                return float(candles[-1].get("close", 0.0))
+
+            return 0.0
+
+        return float(c.get("open", c.get("close", 0.0)))
+
+    def _build_snapshot(self, asset: str) -> Dict[str, Any]:
+
+        return self.collector.get_snapshot(asset)
+
+__all__ = ["TradingLionsBot"]
+
